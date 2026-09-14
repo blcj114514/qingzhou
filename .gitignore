@@ -1,0 +1,21 @@
+# ---- 本地配置与密钥：绝不入库 ----
+portable/qingzhou.json
+qingzhou.json
+*.bak-*
+*.json.bak*
+
+# ---- 便携运行时与发行副本（22MB，由根目录源码构建生成）----
+portable/python/
+portable/qingzhou.py
+
+# ---- 运行数据 ----
+sessions/
+.realtmp/
+*.log
+qingzhou.log*
+
+# ---- 系统 ----
+__pycache__/
+.DS_Store
+Thumbs.db
+.smoke-tmp/
