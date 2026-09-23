@@ -581,6 +581,22 @@ def main():
     check("自动压缩配置项 auto_compact 可关", '"auto_compact"' in src and "auto_compact\", True" in src)
     check("低水位预警文案存在", "上下文已用" in src)
 
+    print("== 28. 小修小补回归（v0.3.1 修复项） ==")
+    check("pretty_model v3 不再吞数字", qz4.pretty_model("glm-v3") == "GLM V3")
+    check("pretty_model v12 完整保留", qz4.pretty_model("llama-v12") == "Llama V12")
+    check("拦行首 Restart-Computer", _hit('Restart-Computer -Force'))
+    check("拦 rd /s 别名", _hit('rd /s /q C:\\temp'))
+    check("不拦 echo Restart-Computer", not _hit('echo Restart-Computer -Force'))
+    cfd = tdir / 'd.json'
+    qzm.save_config(cfd, {'base_url': 'https://x/v1', 'api_key': 'WIZARD_KEY', 'model': 'm'}, allow_api_key=True)
+    check("向导显式同意时 key 可落盘", json.loads(cfd.read_text(encoding='utf-8')).get('api_key') == 'WIZARD_KEY')
+    camp6 = Path(tempfile.mkdtemp())
+    (camp6 / "TASKS.md").write_text("## 待办\n- [ ] P1 不该被执行\n", encoding="utf-8")
+    rc6, out6, err6 = run_qz(["--campaign", "TASKS.md", "--rounds", "0"], camp6)
+    tasks6 = (camp6 / "TASKS.md").read_text(encoding="utf-8")
+    check("--rounds 0 立即收工退出 0", rc6 == 0, out6[-800:] + err6[-400:])
+    check("--rounds 0 不动账本", "[~]" not in tasks6 and "[x]" not in tasks6, tasks6)
+
     server.shutdown()
     print()
     print("════════════════════════════════════")
