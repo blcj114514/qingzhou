@@ -314,7 +314,6 @@ def _poll_keyboard(buf):
     except Exception:
         pass
     return buf, False
-    return buf, None
 
 
 def say(text: str = ""):
@@ -332,7 +331,7 @@ def pretty_model(model: str) -> str:
         if low in BRAND:
             return BRAND[low]
         if re.fullmatch(r"v\d+", low):
-            return "V" + tok[2:]
+            return "V" + tok[1:]
         if re.fullmatch(r"\d+(\.\d+)*", tok):
             return tok
         if re.fullmatch(r"\d+[bkm]", low):
@@ -405,12 +404,13 @@ def env_override(cfg: dict) -> dict:
     return merged
 
 
-def save_config(config_path: Path, cfg: dict):
+def save_config(config_path: Path, cfg: dict, allow_api_key: bool = False):
     """落盘前剔除 env 注入的键，密钥来源为环境变量时绝不写入文件。
 
     双保险：即使 cfg 里没有 _from_env 标记（如运行时手工塞入的值），
     api_key 也只在"配置文件里本来就写着"时才原样保留，防止任何路径
-    把环境变量/内存里的密钥意外落盘。
+    把环境变量/内存里的密钥意外落盘。唯一例外：首次配置向导中用户
+    显式同意保存，此时以 allow_api_key=True 调用。
     """
     file_cfg = load_config(config_path) if config_path.exists() else {}
     clean = {}
@@ -423,8 +423,8 @@ def save_config(config_path: Path, cfg: dict):
                 if k in file_cfg:
                     clean[k] = file_cfg[k]
                 continue
-            if k == "api_key" and k not in file_cfg:
-                # 运行时产生的 key 值：只在用户显式向导存过时才有——跳过
+            if k == "api_key" and k not in file_cfg and not allow_api_key:
+                # 运行时产生的 key 值不新增落盘
                 continue
         clean[k] = v
     config_path.write_text(json.dumps(clean, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -480,7 +480,7 @@ def first_run_wizard(config_path: Path) -> dict:
         if keep in ("n", "no"):
             cfg["api_key"] = ""
             say("已留空；之后请用环境变量 %s 提供密钥。" % ENV_API_KEY)
-    save_config(config_path, cfg)
+    save_config(config_path, cfg, allow_api_key=bool(cfg.get("api_key")))
     say("配置已保存 → %s\n" % config_path)
     return cfg
 
@@ -504,12 +504,12 @@ VALID_EFFORTS = ("none", "low", "medium", "high", "max")
 # 可用配置 "deny_patterns": ["格式串", ...] 追加自定义规则。
 DEFAULT_DENY_PATTERNS = [
     r"rm\s+-rf\s+/",            # 递归强删根/关键路径
-    r"rmdir\s+/s\s+",           # Windows 递归删根
+    r"(?:rd|rmdir)\s+/s\s+",     # Windows 递归删根（rd 是 rmdir 别名）
     r"del\s+/[sq]\s+C:\\",      # Windows del 强删 C 盘
     r"format\s+[a-zA-Z]:",       # 格式化磁盘
     r"mkfs",                      # Linux 格式化
     r":\(\)\s*\{.*\};:",      # fork bomb
-    r"^\s*(shutdown| Restart-Computer)\b", # 关机/重启（行首命令，避免误杀 echo/说明文字）
+    r"^\s*(shutdown|Restart-Computer)\b",  # 关机/重启（行首命令，避免误杀 echo/说明文字）
     r"^\s*diskpart\b",           # 磁盘分区操作（行首）
     r">\s*/dev/sd[a-z]",         # 直写块设备
 ]
@@ -762,7 +762,7 @@ def tool_read_file(args: dict, workspace: Path) -> str:
     return _clip("文件 %s（共 %d 行，显示第 %d-%d 行）\n%s" % (target, len(lines), start, end, numbered))
 
 
-def tool_write_file(args: dict, workspace: Path, _snapshot_registry=None) -> str:
+def tool_write_file(args: dict, workspace: Path) -> str:
     path = str(args.get("path", "")).strip()
     content = args.get("content", "")
     if not path:
@@ -1827,10 +1827,11 @@ def interactive_mode(cfg: dict, gate: PermissionGate, max_steps: int, no_stream:
                     continue
                 new_msgs = compact_messages(llm, messages)
                 if new_msgs is not messages:
+                    old_count = len(messages)
                     session.close()
                     session = Session.branched(new_msgs[1:], session.path.name)
                     messages = new_msgs
-                    say("  已压缩：%d 条消息 → %d 条（旧文件保留全量历史）。" % (len(messages), len(new_msgs)))
+                    say("  已压缩：%d 条消息 → %d 条（旧文件保留全量历史）。" % (old_count, len(new_msgs)))
             elif cmd == "/tasks":
                 say("  %s" % ensure_tasks_file(workspace).read_text(encoding="utf-8", errors="replace"))
             elif cmd == "/handoff":
@@ -1993,12 +1994,14 @@ def campaign_mode(cfg: dict, args, runlog=None):
     stop_path = workspace / STOP_FILE
     ttl = args.lock_ttl
 
-    say("轻舟战役模式 ｜ 账本: %s ｜ 最多 %d 轮 ｜ 锁 TTL %d 秒" % (campaign_path, args.rounds or 10**9, ttl))
+    max_rounds = args.rounds if args.rounds is not None else 10**9
+    say("轻舟战役模式 ｜ 账本: %s ｜ 最多 %s 轮 ｜ 锁 TTL %d 秒" % (
+        campaign_path, max_rounds if args.rounds is not None else "不限", ttl))
     say("⚠ 战役模式每轮以全自动档运行（无人值守，不再逐条确认）。")
     gate = PermissionGate(2, workspace, interactive=False)
     say("收兵方式：在工作区创建文件 %s 即可在下一轮优雅停止。" % STOP_FILE)
 
-    for _round in range(args.rounds or 10**9):
+    for _round in range(max_rounds):
         # 0. STOP 标记：战役结束，不删任何文件
         if stop_path.exists():
             say("发现收兵标记（%s），战役结束。删除该文件可恢复。" % stop_path)
