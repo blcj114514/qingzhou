@@ -597,6 +597,45 @@ def main():
     check("--rounds 0 立即收工退出 0", rc6 == 0, out6[-800:] + err6[-400:])
     check("--rounds 0 不动账本", "[~]" not in tasks6 and "[x]" not in tasks6, tasks6)
 
+    print("== 29. 第二批小修回归 ==")
+    _spec6 = importlib.util.spec_from_file_location('qz_fix2', QZ)
+    qz6 = importlib.util.module_from_spec(_spec6); _spec6.loader.exec_module(qz6)
+    # UTF-8 BOM 不再泄漏进读出内容
+    bomf = tdir / 'bom.txt'
+    bomf.write_bytes(b'\xef\xbb\xbf' + 'hello'.encode('utf-8'))
+    check("UTF-8 BOM 自动去除", not qz6._read_text_smart(bomf).startswith(chr(0xfeff)))
+    # 同秒同名会话不撞文件
+    qz6.SESSIONS_DIR = Path(tempfile.mkdtemp())
+    s1 = qz6.Session.new("同一个任务")
+    s1.close()
+    s2 = qz6.Session.new("同一个任务")
+    s2.close()
+    check("同秒同名会话文件名不冲突", s1.path != s2.path)
+    # undo 孤儿 .bak 自动清理
+    wsd = Path(tempfile.mkdtemp())
+    (wsd / 'x.txt').write_text('v1', encoding='utf-8')
+    qz6.tool_write_file({'path': 'x.txt', 'content': 'v2'}, wsd)
+    qz6.tool_write_file({'path': 'x.txt', 'content': 'v3'}, wsd)
+    n_bak = len(list((wsd / '.qingzhou-undo').glob('*.bak')))
+    check("undo 只留最新一份 .bak", n_bak == 1, "%d 份" % n_bak)
+    # ANSI 状态栏按显示宽度截断不断序列
+    clipped = qz6._clip_display('\x1b[90mabcdef\x1b[0m', 3)
+    check("状态栏截断不断 ANSI 序列", 'abc' in clipped and 'abcd' not in clipped, repr(clipped))
+    # 键盘采集一次排空（Windows msvcrt 桩）
+    if os.name == "nt":
+        import msvcrt
+        _kbhit, _getwch = msvcrt.kbhit, msvcrt.getwch
+        try:
+            _keys = iter(["a", "b", "\r"])
+            msvcrt.kbhit = lambda: True
+            msvcrt.getwch = lambda: next(_keys)
+            b2, done2 = qz6._poll_keyboard("")
+            check("采集器一次排空全部按键", b2 == "ab" and done2 is True, "%r/%r" % (b2, done2))
+        finally:
+            msvcrt.kbhit, msvcrt.getwch = _kbhit, _getwch
+    # 战役任务前缀用正则剥离（尾部 - ] 字符不再被误剥）
+    check("战役 prompt 前缀正则剥离", r're.sub(r"^-\s*\[\s*\]\s*"' in src)
+
     server.shutdown()
     print()
     print("════════════════════════════════════")
