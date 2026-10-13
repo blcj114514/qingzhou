@@ -293,24 +293,34 @@ class Spinner:
 
 def _poll_keyboard(buf):
     """非阻塞收键（消息排队用）：Windows 走 msvcrt，Unix 走 termios。
-    返回 (updated_buf, complete)；回车时 complete=True。"""
+    返回 (updated_buf, complete)；回车时 complete=True。
+    每次调用排空所有已按下的键——只读一个键会让长输出时排队输入一字一顿。"""
     try:
         if os.name == "nt":
             import msvcrt
             while msvcrt.kbhit():
                 ch = msvcrt.getwch()
+                if ch in ("\x00", "\xe0"):
+                    # 功能键/方向键是双码序列：吞掉后缀码，不混入输入缓冲
+                    if msvcrt.kbhit():
+                        msvcrt.getwch()
+                    continue
                 if ch in ("\r", "\n"):
                     return buf, True
                 if ch == "\b":
-                    return buf[:-1], False
-                return buf + ch, False
+                    buf = buf[:-1]
+                    continue
+                buf += ch
         else:
             import select
-            if select.select([sys.stdin], [], [], 0)[0]:
+            while select.select([sys.stdin], [], [], 0)[0]:
                 ch = sys.stdin.read(1)
                 if ch in ("\r", "\n"):
                     return buf, True
-                return buf + ch, False
+                if ch in ("\x7f", "\b"):
+                    buf = buf[:-1]
+                    continue
+                buf += ch
     except Exception:
         pass
     return buf, False
@@ -730,9 +740,9 @@ def _clip(text: str, limit: int = MAX_TOOL_RESULT_CHARS) -> str:
 
 
 def _read_text_smart(path: Path) -> str:
-    """读文件：先按 UTF-8，失败退 GBK，再失败用替换符。"""
+    """读文件：先按 UTF-8（自动去 BOM），失败退 GBK，再失败用替换符。"""
     data = path.read_bytes()
-    for enc in ("utf-8", "gbk"):
+    for enc in ("utf-8-sig", "gbk"):
         try:
             return data.decode(enc)
         except UnicodeDecodeError:
@@ -804,6 +814,13 @@ def _write_undo_registry(undo_dir: Path, target: str, backup: str):
             json.dumps([{"path": target, "backup": backup}], ensure_ascii=False), encoding="utf-8")
         _last_write_backup["path"] = target
         _last_write_backup["backup"] = backup
+        # 单步回滚只认最新一份快照：旧 .bak 已成孤儿，顺手清掉（便携盘空间有限）
+        for old in undo_dir.glob("*.bak"):
+            if str(old) != backup:
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
     except OSError:
         pass
 
@@ -1150,6 +1167,9 @@ class Session:
         SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         name = "%s-%s.jsonl" % (stamp, slugify(first_user_msg))
+        if (SESSIONS_DIR / name).exists():
+            # 同一秒同名（双开/立即重试）：加 pid 后缀，避免两路会话写进同一文件
+            name = "%s-%s-%d.jsonl" % (stamp, slugify(first_user_msg), os.getpid())
         session = cls(SESSIONS_DIR / name)
         session._write({"t": "meta", "version": QZ_VERSION, "cwd": os.getcwd(),
                         "created": datetime.now().isoformat(timespec="seconds")})
@@ -1307,6 +1327,8 @@ class Agent:
                     if len(self.message_queue) < 10:
                         self.message_queue.append(qbuf.strip())
                         say(THEME.c(THEME.dim, "  ▸ 已排队（%d）：" % len(self.message_queue)) + qbuf.strip()[:50])
+                    else:
+                        say(THEME.c(THEME.yellow, "  ▸ 排队已满（10），本条丢弃：") + qbuf.strip()[:50])
                     qbuf = ""
                 self._qbuf = qbuf
             spinner = Spinner(pretty_model(self.llm.model) + (("(%s) " % self.llm.effort if self.llm.effort else "") + "思考中"))
@@ -1676,12 +1698,29 @@ class FixedBottomUI:
         self.rows, self.cols = self._term_size()
         if self.rows < 10:
             return
-        status1 = status[: max(1, self.cols - 2)]
+        status1 = _clip_display(status, max(1, self.cols - 2))
         # 状态栏（倒数第2行）+ 输入提示（倒数第1行）
         self._write("\x1b[%d;1H\x1b[2K%s" % (self.rows - 1, status1))
         self._write("\x1b[%d;1H\x1b[2K%s" % (self.rows, prompt_char))
         # 光标放回输入行提示符之后
         self._write("\x1b[%d;%dH" % (self.rows, _disp_width(prompt_char) + 1))
+
+
+def _clip_display(text: str, max_width: int) -> str:
+    """按显示宽度截断：ANSI 转义序列不占宽，且保证不会被截在序列中间。"""
+    out = []
+    w = 0
+    for seg in re.split(r"(\x1b\[[0-9;]*[A-Za-z])", text):
+        if seg.startswith("\x1b["):
+            out.append(seg)
+            continue
+        for ch in seg:
+            cw = _disp_width(ch)
+            if w + cw > max_width:
+                return "".join(out) + THEME.reset
+            out.append(ch)
+            w += cw
+    return "".join(out)
 
 
 def interactive_mode(cfg: dict, gate: PermissionGate, max_steps: int, no_stream: bool, resume_latest: bool, runlog=None, config_path=None):
@@ -2041,7 +2080,8 @@ def campaign_mode(cfg: dict, args, runlog=None):
                       "请直接开始完成这个任务。要求：\n"
                       "1. 先用 list_dir/read_file 了解现场，再动手；\n"
                       "2. 完成后调用 final_answer，answer 里写清：做了什么、产出在哪、验收方式；\n"
-                      "3. 做不完也要 final_answer 说明卡在哪里，不要空转。" % (prio, original_line.strip("-[ ]")))
+                      "3. 做不完也要 final_answer 说明卡在哪里，不要空转。" % (
+                          prio, re.sub(r"^-\s*\[\s*\]\s*", "", original_line.strip())))
             agent = Agent(cfg, gate, session, max_steps=args.max_steps, no_stream=args.no_stream,
                           quiet_stream=False, hooks=_project_hooks(workspace, cfg), runlog=runlog,
                           deny_patterns=compile_deny_patterns(cfg, workspace))
